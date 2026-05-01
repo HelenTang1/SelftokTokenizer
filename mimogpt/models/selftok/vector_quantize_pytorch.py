@@ -1006,7 +1006,7 @@ class VectorQuantize(nn.Module):
             all_distances = distances
             scaled_distances = all_distances * 10.0
             entropy_to_max, entropy_to_min = calc_entropy(
-                scaled_distances.flatten(end_dim=-2), min_ref=self.entropy_min_ref
+                scaled_distances.flatten(end_dim=-2)
             )
             # codebook entropy
             if self.smart_re_K:

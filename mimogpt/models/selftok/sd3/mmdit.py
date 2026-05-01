@@ -345,6 +345,83 @@ class SwiGLUFeedForward(nn.Module):
     def forward(self, x):
         return self.w2(nn.functional.silu(self.w1(x)) * self.w3(x))
 
+# TODO: DEBUG
+def _probe_save(probe: Optional[dict], name: str, x, keep_full: bool = False):
+    if probe is None or x is None:
+        return
+
+    if torch.is_tensor(x):
+        with torch.no_grad():
+            x = x.detach().float()
+
+            if keep_full:
+                probe[name] = x.cpu()
+            elif x.ndim == 0:
+                probe[name] = x.cpu()
+            elif x.ndim == 1:
+                probe[name] = x.cpu()
+            else:
+                probe[name] = x.reshape(x.shape[0], -1).mean(dim=1).cpu()
+    else:
+        probe[name] = x
+
+
+def _compute_x_attn_probe_stats(query, key, value, heads, context_len, x_len, attn_mask=None):
+    b, _, dim = query.shape
+    assert dim % heads == 0, f"dim={dim} must be divisible by heads={heads}"
+
+    dim_head = dim // heads
+
+    with torch.no_grad():
+        q = query.reshape(b, -1, heads, dim_head).transpose(1, 2)
+        k = key.reshape(b, -1, heads, dim_head).transpose(1, 2)
+
+        logits = torch.matmul(q.float(), k.float().transpose(-2, -1))
+        logits = logits * (dim_head ** -0.5)
+
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(device=logits.device)
+
+            if attn_mask.dtype == torch.bool:
+                logits = logits.masked_fill(~attn_mask, float("-inf"))
+            else:
+                logits = logits + attn_mask.to(dtype=logits.dtype)
+
+        attn_weight = torch.softmax(logits, dim=-1)
+
+        context_slice = slice(0, context_len)
+        x_slice = slice(context_len, context_len + x_len)
+
+        x_to_context = (
+            attn_weight[:, :, x_slice, context_slice]
+            .sum(dim=-1)
+            .mean(dim=(1, 2))
+        )
+
+        x_to_x = (
+            attn_weight[:, :, x_slice, x_slice]
+            .sum(dim=-1)
+            .mean(dim=(1, 2))
+        )
+
+        context_to_x = (
+            attn_weight[:, :, context_slice, x_slice]
+            .sum(dim=-1)
+            .mean(dim=(1, 2))
+        )
+
+        context_to_context = (
+            attn_weight[:, :, context_slice, context_slice]
+            .sum(dim=-1)
+            .mean(dim=(1, 2))
+        )
+
+    return (
+        x_to_context.detach().cpu(),
+        x_to_x.detach().cpu(),
+        context_to_x.detach().cpu(),
+        context_to_context.detach().cpu(),
+    )
 
 class DismantledBlock(nn.Module):
     """A DiT block with gated adaptive layer norm (adaLN) conditioning."""
@@ -438,7 +515,7 @@ class DismantledBlock(nn.Module):
         self.pre_only = pre_only
         
         
-    def pre_attention(self, x: torch.Tensor, c: torch.Tensor):
+    def pre_attention(self, x: torch.Tensor, c: torch.Tensor, probe: Optional[dict]=None, prefix: str = ""):
         assert x is not None, "pre_attention called with None input"
         if not self.pre_only:
             if not self.scale_mod_only:
@@ -449,6 +526,8 @@ class DismantledBlock(nn.Module):
                         pos_embed = self.diti.get_position(torch.arange(K).to(x.device))
                     else:
                         pos_embed = torch.arange(K).to(x.device)
+                    # TODO: DEBUG probe pos_embed
+                    _probe_save(probe, f"{prefix}.pos_embed", pos_embed)
                     if self.time_adaln == 'pos_t_emb':
                         c_pos_embed = self.t_embedder(pos_embed).unsqueeze(0).repeat(c.shape[0], 1, 1)
                         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c.unsqueeze(1).repeat(1, c_pos_embed.shape[1], 1)
@@ -456,10 +535,23 @@ class DismantledBlock(nn.Module):
                     else:
                         c_pos_embed = self.t_embedder(pos_embed)
                         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c_pos_embed).chunk(6, dim=1)
-                        
+                    # TODO: DEBUG
+                    _probe_save(probe, f"{prefix}.c_pos_embed", c_pos_embed.mean())
+                    _probe_save(probe, f"{prefix}.shift_msa", shift_msa.mean())
+                    _probe_save(probe, f"{prefix}.scale_msa_abs", scale_msa.abs().mean())
+                    _probe_save(probe, f"{prefix}.gate_msa_abs", gate_msa.abs().mean())
+                    _probe_save(probe, f"{prefix}.shift_mlp", shift_mlp.mean())
+                    _probe_save(probe, f"{prefix}.scale_mlp_abs", scale_mlp.abs().mean())
+                    _probe_save(probe, f"{prefix}.gate_mlp_abs", gate_mlp.abs().mean())
                 elif self.time_adaln == 't_emb':   
+                    _probe_save(probe, f"{prefix}.c", c)
                     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)   
-                    
+                    _probe_save(probe, f"{prefix}.shift_msa", shift_msa)
+                    _probe_save(probe, f"{prefix}.scale_msa_abs", scale_msa.abs())
+                    _probe_save(probe, f"{prefix}.gate_msa_abs", gate_msa.abs())
+                    _probe_save(probe, f"{prefix}.shift_mlp", shift_mlp)
+                    _probe_save(probe, f"{prefix}.scale_mlp_abs", scale_mlp.abs())
+                    _probe_save(probe, f"{prefix}.gate_mlp_abs", gate_mlp.abs())
                 else:
                     raise ValueError(f'please provide a valid time_adaln value, got {self.time_adaln}')
 
@@ -472,27 +564,56 @@ class DismantledBlock(nn.Module):
                 qkv = self.attn.pre_attention(modulate(self.norm1(x), shift_msa, scale_msa,dim=0))
             else:
                 qkv = self.attn.pre_attention(modulate(self.norm1(x), shift_msa, scale_msa,dim=1))
+            # TODO: DEBUG
+            _probe_save(probe, f"{prefix}.q", qkv[0])
+            _probe_save(probe, f"{prefix}.k", qkv[1])
+            _probe_save(probe, f"{prefix}.v", qkv[2])
             return qkv, (x, gate_msa, shift_mlp, scale_mlp, gate_mlp)
         else:
+            _probe_save(probe, f"{prefix}.c", c)
             if not self.scale_mod_only:
                 shift_msa, scale_msa = self.adaLN_modulation(c).chunk(2, dim=1)
             else:
                 shift_msa = None
                 scale_msa = self.adaLN_modulation(c)
+            # TODO: DEBUG
+            _probe_save(probe, f"{prefix}.shift_msa_abs", shift_msa.abs() if shift_msa is not None else None)
+            _probe_save(probe, f"{prefix}.scale_msa_abs", scale_msa.abs())
             qkv = self.attn.pre_attention(modulate(self.norm1(x), shift_msa, scale_msa))
+            # TODO: DEBUG
+            _probe_save(probe, f"{prefix}.q", qkv[0])
+            _probe_save(probe, f"{prefix}.k", qkv[1])
+            _probe_save(probe, f"{prefix}.v", qkv[2])
             return qkv, None
 
-    def post_attention(self, attn, x, gate_msa, shift_mlp, scale_mlp, gate_mlp):
+    def post_attention(self, attn, x, gate_msa, shift_mlp, scale_mlp, gate_mlp, probe: Optional[dict]=None, prefix: str = ""):
         assert not self.pre_only
         if self.time_adaln == 'pos_t_emb':
             x = self.post_norm1(self.ln_scale*x + gate_msa * self.attn.post_attention(attn))
             x = self.post_norm2(self.ln_scale*x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp,dim=0)))
         elif self.time_adaln == 'pos_emb':
             x = self.post_norm1(self.ln_scale*x + gate_msa.unsqueeze(0) * self.attn.post_attention(attn))
+            
+            # TODO: DEBUG
+            with torch.no_grad():
+                _probe_save(probe, f"{prefix}.post_attn", self.attn.post_attention(attn))
+                _probe_save(probe, f"{prefix}.post_gate_norm1", x)
             x = self.post_norm2(self.ln_scale*x + gate_mlp.unsqueeze(0) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp,dim=0)))
+            # TODO: DEBUG
+            with torch.no_grad():
+                _probe_save(probe, f"{prefix}.post_modulate_mlp", self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp,dim=0)))
+                _probe_save(probe, f"{prefix}.post_gate_norm2", x)
         elif self.time_adaln == 't_emb':
             x = self.post_norm1(self.ln_scale*x + gate_msa.unsqueeze(1) * self.attn.post_attention(attn))
+            # TODO: DEBUG
+            with torch.no_grad():
+                _probe_save(probe, f"{prefix}.post_attn", self.attn.post_attention(attn))
+                _probe_save(probe, f"{prefix}.post_gate_norm1", x)
             x = self.post_norm2(self.ln_scale*x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp,dim=1)))            
+            # TODO: DEBUG
+            with torch.no_grad():
+                _probe_save(probe, f"{prefix}.post_modulate_mlp", self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp,dim=0)))
+                _probe_save(probe, f"{prefix}.post_gate_norm2", x)
         return x
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
@@ -505,14 +626,21 @@ class DismantledBlock(nn.Module):
             return self.post_attention(attn, *intermediates)
 
 
-def block_mixing(context, x, context_block, x_block, context_block_low_res, context_lowres, c, mask=None, rec_block=None, rec=None, c0=None):
+def block_mixing(context, x, context_block, x_block, context_block_low_res, context_lowres, c, mask=None, rec_block=None, rec=None, c0=None,
+                 # TODO: DEBUG
+                 probe: Optional[dict] = None, block_idx: Optional[int] = None):
     assert context is not None, "block_mixing called with None context"
+    prefix = f"block_{block_idx}"
+
+    _probe_save(probe, f"{prefix}.context_in", context)
+    _probe_save(probe, f"{prefix}.x_in", x)
+
     # pre-attention
-    context_qkv, context_intermediates = context_block.pre_attention(context, c)
-    x_qkv, x_intermediates = x_block.pre_attention(x, c)
+    context_qkv, context_intermediates = context_block.pre_attention(context, c, probe=probe, prefix=prefix+".context")
+    x_qkv, x_intermediates = x_block.pre_attention(x, c, probe=probe, prefix=prefix+".x")
     rec, kv_append = rec_block(rec, c0) if rec_block is not None else (None, None)
     context_qkv_lowres, context_intermediates_lowres = \
-        context_block_low_res.pre_attention(context_lowres, c) \
+        context_block_low_res.pre_attention(context_lowres, c, probe=probe, prefix=prefix+".context_lowres") \
             if context_block_low_res is not None else (None, None)
     
     # mixing
@@ -527,22 +655,39 @@ def block_mixing(context, x, context_block, x_block, context_block_low_res, cont
 
     # joint attn
     q, k, v = tuple(o)
-    attn = attention(q, k, v, x_block.attn.num_heads, mask)
     context_len = context_qkv[0].shape[1]
     x_len = x_qkv[0].shape[1]
+    attn = attention(q, k, v, x_block.attn.num_heads, mask)
+
+    # TODO: DEBUG
+    x_to_context, x_to_x, context_to_x, context_to_context = _compute_x_attn_probe_stats(q, k, v, x_block.attn.num_heads, context_len, x_len, mask)
+    _probe_save(probe, f"{prefix}.x_to_context_attn_mass", x_to_context)
+    _probe_save(probe, f"{prefix}.x_to_x_attn_mass", x_to_x)
+    _probe_save(probe, f"{prefix}.context_to_x_attn_mass", context_to_x)
+    _probe_save(probe, f"{prefix}.context_to_context_attn_mass", context_to_context)
+
     context_attn, x_attn = (
         attn[:,:context_len],
         attn[:,context_len:context_len+x_len]
     )
     context_attn_lowres = attn[:,context_len+x_len:] \
         if context_block_low_res is not None else None
+    
+    # TODO: DEBUG
+    _probe_save(probe, f"{prefix}.context_attn", context_attn)
+    _probe_save(probe, f"{prefix}.x_attn", x_attn)
 
     # post attn
     if not context_block.pre_only:
-        context = context_block.post_attention(context_attn, *context_intermediates)
+        context = context_block.post_attention(context_attn, *context_intermediates, probe=probe, prefix=prefix+".context")
     else:
         context = None
-    x = x_block.post_attention(x_attn, *x_intermediates)
+    x = x_block.post_attention(x_attn, *x_intermediates, probe=probe, prefix=prefix+".x")
+    
+    # TODO: DEBUG
+    _probe_save(probe, f"{prefix}.context_out", context)
+    _probe_save(probe, f"{prefix}.x_out", x)
+    
     if context_block_low_res is not None and (not context_block_low_res.pre_only):
         context_lowres = context_block_low_res.post_attention(
             context_attn_lowres, *context_intermediates_lowres
@@ -586,7 +731,9 @@ class JointBlock(nn.Module):
         else:
             self.rec_block = None
 
-    def _forward(self, context, x, c, context_lowres=None, rec=None, mask=None, c0=None):
+    def _forward(self, context, x, c, context_lowres=None, rec=None, mask=None, c0=None, 
+                 # TODO: DEBUG
+                 probe: Optional[dict]=None, block_idx: Optional[int]=None):
         return block_mixing(
             context, x,
             context_block=self.context_block,
@@ -594,16 +741,19 @@ class JointBlock(nn.Module):
             context_block_low_res=self.context_block_low_res,
             rec_block=self.rec_block,
             context_lowres=context_lowres,
-            c=c, mask=mask, rec=rec, c0=c0
+            c=c, mask=mask, rec=rec, c0=c0,
+            # TODO: DEBUG
+            probe=probe, block_idx=block_idx
         )
 
-    def forward(self, context, x, c, context_lowres=None, rec=None, mask=None, c0=None):
+    def forward(self, context, x, c, context_lowres=None, rec=None, mask=None, c0=None, probe: Optional[dict]=None, block_idx: Optional[int]=None):
         if self.use_checkpoint:
             return torch.utils.checkpoint.checkpoint(
-                self._forward, context, x, c, context_lowres, rec, mask, use_reentrant=False, c0=c0
-            )
+                self._forward, context, x, c, context_lowres, rec, mask, c0)
         else:
-            return self._forward(context, x, c, context_lowres, rec, mask, use_reentrant=False, c0=c0)
+            return self._forward(context, x, c, context_lowres, rec, mask, c0, 
+                                 # TODO: DEBUG
+                                 probe=probe, block_idx=block_idx)
 
 
 class FinalLayer(nn.Module):
@@ -638,10 +788,16 @@ class FinalLayer(nn.Module):
             nn.init.constant_(self.linear.bias, 0)
 
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, c: torch.Tensor, probe: Optional[Dict] = None) -> torch.Tensor:
+        _probe_save(probe, "final_layer.x_in", x)
+        _probe_save(probe, "final_layer.c_in", c)
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        _probe_save(probe, "final_layer.shift", shift)
+        _probe_save(probe, "final_layer.scale", scale)
         x = modulate(self.norm_final(x), shift, scale)
+        _probe_save(probe, "final_layer.norm_modulated", x)
         x = self.linear(x)
+        _probe_save(probe, "final_layer.output", x)
         return x
 
 
@@ -675,7 +831,7 @@ class MMDiT(nn.Module):
         device=None,
         train_filter=["attn", "adaLN_modulation", "context_embedder", "mlp"],
         freeze_filter=[],
-        use_checkpoint=True,
+        use_checkpoint=False,
         sd3_cond_pooling=None,
         uncond_c_file='./selftok/uncond_c_after.pt', 
         uncond_y_file='./selftok/uncond_y_after.pt',
@@ -915,7 +1071,9 @@ class MMDiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, w * p))
         return imgs
 
-    def forward_core_with_concat(self, x, c_mod, context=None, context_lowres=None, rec=None, mask=None, c0=None):
+    def forward_core_with_concat(self, x, c_mod, context=None, context_lowres=None, rec=None, mask=None, c0=None, 
+                                 # TODO: DEBUG
+                                 probe: Optional[dict]=None):
         if self.register_length > 0:
             context = torch.cat(
                 (
@@ -927,9 +1085,14 @@ class MMDiT(nn.Module):
         
         for i, block in enumerate(self.joint_blocks):
             context, x, context_lowres, rec = block(
-                context, x, rec=rec, context_lowres=context_lowres, c=c_mod, mask=mask, c0=c0
+                context, x, rec=rec, context_lowres=context_lowres, c=c_mod, mask=mask, c0=c0,
+                # TODO: DEBUG
+                probe=probe, block_idx=i
             )
-        x = self.final_layer(x, c_mod)  # (N, T, patch_size ** 2 * out_channels)
+        x = self.final_layer(x, c_mod, 
+                             # TODO: DEBUG
+                             probe=probe)  # (N, T, patch_size ** 2 * out_channels)
+        _probe_save(probe, "final_layer.out_tokens", x)
         return x
 
     def drop_cond(self, context, context_lowres, y, mask, t):
@@ -996,11 +1159,16 @@ class MMDiT(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
+        probe = kwargs.pop("probe", None)
+        _probe_save(probe, "input.x_raw", x)
+        _probe_save(probe, "input.t_raw", t)
+        _probe_save(probe, "input.context_condition", encoder_hidden_states)
+        
         hw = x.shape[-2:]
         t = t * 1000.0
         x = self.x_embedder(x) + self.cropped_pos_embed(hw)
-
-
+        # TODO: DEBUG
+        _probe_save(probe, "embed.x_tokens", x)
 
         low_res_latent = kwargs.get("low_res_latent", None)
         x_mask = kwargs.get("x_mask", None)
@@ -1012,6 +1180,10 @@ class MMDiT(nn.Module):
         context_see_xt = kwargs.get("context_see_xt", False)
         context_see_rec = kwargs.get("context_see_rec", False)
 
+        # TODO: DEBUG
+        assert context_see_xt == True, "context_see_xt should be True for DiT training"
+        assert context_see_rec == False, "context_see_rec should be False for DiT training"
+
         if self.low_res is not None:
             hw_low_res = low_res_latent.shape[-2:]
             rec = self.x_embedder_clean(low_res_latent) + self.cropped_pos_embed(hw_low_res)  # shape=16*16*1536
@@ -1021,9 +1193,16 @@ class MMDiT(nn.Module):
             rec = None
         c = self.t_embedder(t, dtype=x.dtype)  # (N, D)  for image t-based
         c0 = self.t_embedder(torch.zeros_like(t))  # (N, D)  for rec t=0
-        
+        # TODO: DEBUG
+        _probe_save(probe, "input.t_1000", t)
+        _probe_save(probe, "input.time_c_min", c.min())
+        _probe_save(probe, "input.time_c_max", c.max())
+        _probe_save(probe, "input.time_c_mean", c.mean()) #之前embed.time_c全0，怪怪的
+ 
         # self.context_pos_embed  # (1, K, D)  for context t-agnostic, token_pos-based
         context = self.context_embedder(encoder_hidden_states).to(x.dtype) + self.context_pos_embed
+        # TODO: DEBUG
+        _probe_save(probe, "embed.context", context)
 
         if hidden_states_low_res is not None and self.low_res_context:
             context_lowres = \
@@ -1077,7 +1256,9 @@ class MMDiT(nn.Module):
         context_mask = context_mask.unsqueeze(1).unsqueeze(2).repeat(1,1,self.register_length+context.shape[1],1)
         context_lowres_mask = context_lowres_mask.unsqueeze(1).unsqueeze(2).repeat(1,1,context_lowres.shape[1],1) \
             if context_lowres is not None else None
-        
+        # TODO: DEBUG
+        _probe_save(probe, "mask.context_mask", context_mask)
+
         # construct img mask
         img_mask_args = [mask, x_mask]
         
@@ -1087,6 +1268,9 @@ class MMDiT(nn.Module):
             img_mask_args.append(rec_mask)
         img_mask = torch.cat(img_mask_args, dim=1)
         img_mask = img_mask.bool().unsqueeze(1).unsqueeze(2).repeat(1,1,x.shape[1],1)
+        
+        # TODO: DEBUG
+        _probe_save(probe, "mask.img_mask", img_mask)
         # aggregate mask
         agg_args = [context_mask, img_mask]
         if context_lowres is not None:
@@ -1094,10 +1278,12 @@ class MMDiT(nn.Module):
         mask = torch.cat(agg_args, dim=2)
 
         x = self.forward_core_with_concat(
-            x, c, context, rec=rec, context_lowres=context_lowres, mask=mask, c0=c0
+            x, c, context, rec=rec, context_lowres=context_lowres, mask=mask, c0=c0, probe=probe
         )
 
         x = self.unpatchify(x, hw=hw)  # (N, out_channels, H, W)
+        # TODO: DEBUG
+        _probe_save(probe, "output.pred", x)
         return x, drop_ids
 
     

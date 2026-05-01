@@ -13,13 +13,13 @@ common:
     use_2d_rope: 0
     use_deepspeed: 0
     random_seed: 123
-    log_interval: 50
+    log_interval: 10
     machines: 1
     task: 'selftokenc'
     experiment_index: 0
     delete_after_upload: True
     log_recon_interval: 100
-    val_interval: 0
+    val_interval: 50
     ckpt_interval: 1000
     vae_path: '/cache/data/sd3_medium.pt'
     resume_exclude_opt: False
@@ -31,7 +31,7 @@ model:
     pretrain_model: ''
 
 optimize:
-    max_epochs: 1000
+    max_epochs: 5000
     warmup_epochs: 0.01
     ema_in_cpu: False
     grad_norm: 0.0

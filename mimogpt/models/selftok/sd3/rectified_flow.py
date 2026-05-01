@@ -161,7 +161,11 @@ class RectifiedFlow(torch.nn.Module):
         if recon_ratio != 1.0 and self.force_recon:
             terms["loss"] = recon_ratio*terms["loss"] + (1-recon_ratio)*mean_flat((v_gt - v) ** 2)
         return terms
-
+    def _make_fixed_probe_noise(self, shape, device, seed: int = 0):
+        g = torch.Generator(device=device)
+        g.manual_seed(seed)
+        return torch.randn(shape, generator=g, device=device)
+    
     def p_sample_loop(
         self,
         model,
@@ -182,6 +186,8 @@ class RectifiedFlow(torch.nn.Module):
         super_mask=None,
         device=None,
         t2k = 1.,
+        gt_x0 = None,
+        return_debug: bool = False,
         **kwargs,
     ):
         batch_size = shape[0]
@@ -189,14 +195,28 @@ class RectifiedFlow(torch.nn.Module):
             device = next(model.parameters()).device
  
         if noise is None:
-            img = torch.randn(*shape, device=device)
+            # TODO: real run
+            # img = torch.randn(*shape, device=device)
+            # TODO: DEBUG
+            img = self._make_fixed_probe_noise(shape, device=device, seed=0)
         else:
             img = noise
+        
+        initial_noise = img.detach().clone()
+        debug_list = []
+        gt_velocity = None
+        if gt_x0 is not None:
+            gt_x0 = gt_x0.to(device=device, dtype=img.dtype)
+            gt_velocity = initial_noise.float() - gt_x0.float()
             
         encoder_hidden_states = model_kwargs['encoder_hidden_states']
-  
+        # TODO: DEBUG
+        probe_list = []
         for i, step in enumerate(self.scheduled_t):
-            t = torch.tensor([step] * batch_size, device=device)  # step：1~0
+            # t = torch.tensor([step] * batch_size, device=device)  # step：1~0
+            raw_t = torch.tensor([step] * batch_size, device=device)
+            t = raw_t
+            x_before = img.detach()
             with torch.no_grad():
                 if cond_vary:
                     if diti.stages != None:
@@ -240,8 +260,14 @@ class RectifiedFlow(torch.nn.Module):
                         model_to_use = model
                 else:
                     model_to_use = model
+                
+                # TODO: DEBUG
+                if i % 10 == 0:
+                    probe = {}
+                else:
+                    probe = None
  
-                img, pred_x0 = self.sample_one_step(
+                img, pred_x0, pred_velocity = self.sample_one_step(
                     model_to_use,
                     img,
                     t,
@@ -250,9 +276,36 @@ class RectifiedFlow(torch.nn.Module):
                     cfg_scale=uncond_scale,
                     uncond_y=uncond_y,
                     uc=uncond_c,
+                    # TODO: DEBUG
+                    probe=probe, 
                     **kwargs,
                 )
+                # TODO: DEBUG
+                if probe is not None:
+                    probe["meta.curr_idx"] = i
+                    probe["meta.step_value"] = float(step)
+                    probe["meta.token_schedule"] = float(self.scheduled_t[i].item())
+                    probe_list.append(probe)
+                if return_debug:
+                    debug_item = {
+                        "raw_t": raw_t.detach().cpu(),
+                        "model_t": t.detach().cpu(),
+                        "x": x_before.detach().cpu(),
+                        "pred_velocity": pred_velocity.detach().cpu(),
+                    }
 
+                    if gt_velocity is not None:
+                        mse = ((gt_velocity - pred_velocity.float()) ** 2).flatten(1).mean(dim=1)
+
+                        debug_item["gt_velocity"] = gt_velocity.detach().cpu()
+                        debug_item["mse"] = mse.detach().cpu()
+
+                    debug_list.append(debug_item)
+        if return_debug:
+            debug_meta = {
+                "initial_noise": initial_noise.detach().cpu()
+            }
+            return img, debug_list, debug_meta, probe_list
         return img
  
     def sample_one_step(
@@ -265,6 +318,8 @@ class RectifiedFlow(torch.nn.Module):
         cfg_scale=1.0,
         uncond_y=None,
         uc=None,
+        # TODO: DEBUG
+        probe = None,
         **kwargs,
     ):
         if model_kwargs is None:
@@ -276,7 +331,7 @@ class RectifiedFlow(torch.nn.Module):
         if cfg_scale == 1.0:
             if self.is_eval == True:
                 x = x.float()
-            out, _ = model(x, t, **model_kwargs)
+            out, _ = model(x, t, probe=probe, **model_kwargs)
         else:
             context = model_kwargs['encoder_hidden_states']
             ori_mask = model_kwargs['mask']
@@ -291,7 +346,14 @@ class RectifiedFlow(torch.nn.Module):
         img, pred_x0 = self.base_step(
             x, out, a_t=a_t, a_prev=a_prev, **kwargs
         )
-        return img, pred_x0
+        # TODO: DEBUG
+        if probe is not None:
+            probe["sampler.pred_v_noise"] = out.detach().float().cpu()
+            probe["sampler.pred_x0"] = pred_x0.detach().float().cpu()
+            probe["sampler.x_after_step"] = img.detach().float().cpu()
+            probe["sampler.a_t"] = a_t.detach().float().cpu()
+            probe["sampler.a_prev"] = a_prev.detach().float().cpu()
+        return img, pred_x0, out
     
     def base_step(self, x, v, a_t, a_prev):
         # Base sampler uses Euler numerical integrator.

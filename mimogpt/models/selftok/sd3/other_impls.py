@@ -36,13 +36,13 @@ if DEVICE_TYPE == "npu":
 
 def attention(q, k, v, heads, mask=None):
     """Convenience wrapper around a basic attention operation"""
-    b, _, dim_head = q.shape
+    b, _, dim_head = q.shape # (B, total_len, D)
     dim_head //= heads
-    q, k, v = map(lambda t: t.view(b, -1, heads, dim_head).transpose(1, 2), (q, k, v))
+    q, k, v = map(lambda t: t.view(b, -1, heads, dim_head).transpose(1, 2), (q, k, v)) # (B, head, total_len, head_dim)
     if DEVICE_TYPE == "gpu":
     # if True:  # for debug!
         out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
-        return out.transpose(1, 2).reshape(b, -1, heads * dim_head)
+        return out.transpose(1, 2).reshape(b, -1, heads * dim_head) # (B, total_len, D)
     else:
         y = torch_npu.npu_fusion_attention(
             q,

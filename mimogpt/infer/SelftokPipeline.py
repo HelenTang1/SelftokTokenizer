@@ -198,7 +198,7 @@ class SelftokPipeline():
             self.ema.to(device)
         self.model.to(device)
         
-        self._steps = 50
+        self._steps = 100
         self.flow = RectifiedFlow(
             self._steps, self.start, self.cut_of_k, val_schedule='uniform', shift=1.0, **cfg.tokenizer.params.noise_schedule_config,
         )
@@ -225,12 +225,18 @@ class SelftokPipeline():
         return tokens
 
     @torch.no_grad()
-    def decoding(self, idx, device):
+    def decoding(self, idx, device, return_debug=False, gt_images=None):
 
         print(f"Begin decoding.")
         
         token_idx = torch.from_numpy(idx).to(device)
         B = token_idx.shape[0]
+        gt_x0 = None
+        if return_debug and gt_images is not None:
+            gt_images = gt_images.to(dtype=self.dtype, device=device)
+            gt_x0 = self.vae.encode(gt_images, return_dict=False)[0].mode()
+            gt_x0 = SD3LatentFormat().process_in(gt_x0)
+            gt_x0 = gt_x0.to(torch.float32)
 
         
         outs_q = self.model.encoder.quantizer.get_output_from_indices(token_idx)
@@ -274,12 +280,30 @@ class SelftokPipeline():
                 ori_hidden_states=ori_hidden_states,**kwargs
             )
         else: # here
-            pred_x0 = self.flow.p_sample_loop(
+            sample_out  = self.flow.p_sample_loop(
                 self.model.model, xt.shape, xt, model_kwargs=model_kwargs,
                 start_t=self._steps, cond_vary=self.cond_vary,
                 diti=self.diti, encoder=self.model.encoder, x_0=enc_in,
-                ori_hidden_states=ori_hidden_states,**kwargs
+                ori_hidden_states=ori_hidden_states,
+                return_debug=return_debug, gt_x0=gt_x0,
+                **kwargs
             )
+            if return_debug:
+                pred_x0, reverse_debug_list, debug_meta, probe_list = sample_out 
+            else:
+                pred_x0 = sample_out
+            
+            training_debug_list = None
+            if return_debug and gt_x0 is not None:
+                initial_noise = debug_meta["initial_noise"].to(device)
+
+                # training_debug_list = self.collect_training_path_debug(
+                #     gt_x0=gt_x0,
+                #     initial_noise=initial_noise,
+                #     token_idx=token_idx,
+                #     outs_q=outs_q,
+                #     device=device,
+                # )
 
         if self.model_type == 'sd3':
             pred_x0_out = SD3LatentFormat().process_out(pred_x0)
@@ -291,6 +315,12 @@ class SelftokPipeline():
 
         print('End decoding.')
         
+        if return_debug:
+            debug_dict = {
+                "reverse": reverse_debug_list,
+                # "training": training_debug_list,
+            }
+            return recons, debug_dict, probe_list
         return recons
     
     @torch.no_grad()
@@ -320,6 +350,79 @@ class SelftokPipeline():
         print('End decoding with Renderer.')
         
         return recons
+    
+    @torch.no_grad()
+    def collect_training_path_debug(
+        self,
+        gt_x0,
+        initial_noise,
+        token_idx,
+        outs_q,
+        device,
+    ):
+        """
+        Evaluate the model on training path:
+            x_t = q_sample(x0, t, noise=initial_noise)
+
+        Returns a list of per-step debug info.
+        """
+
+        B = gt_x0.shape[0]
+
+        # same fixed GT velocity
+        gt_velocity = initial_noise.float() - gt_x0.float()
+
+        # same shift logic as training
+        if (gt_x0.shape[2] * gt_x0.shape[3] / 4096.0) < 0.5:
+            shift = 1.0
+        else:
+            shift = 1.878
+
+        debug_list = []
+
+        for raw_t_scalar in self.flow.scheduled_t:
+            raw_t = torch.full((B,), raw_t_scalar.item(), device=device, dtype=gt_x0.dtype)
+
+            # IMPORTANT:
+            # token schedule uses raw_t before shift, same as training
+            if self.model.k_m is None:
+                t_tmp = (self.model.t2k * raw_t).clamp(0, 1.0)
+                k_batch = self.diti.to_indices(t_tmp * 1000.0)
+            else:
+                t_tmp = (self.model.t2k * raw_t).clamp(0, 1.0)
+                k_batch = self.diti.to_indices(t_tmp)
+
+            enc_mask = self.model.encoder.get_encoder_mask(token_idx, k_batch)
+            mask_v = enc_mask[..., None].expand_as(outs_q)
+            encoder_hidden_states = outs_q * mask_v
+
+            # model time uses shifted t, same as training
+            model_t = self.model.diffusion.shift_t(raw_t, shift)
+
+            model_kwargs = dict(
+                encoder_hidden_states=encoder_hidden_states,
+                mask=enc_mask,
+                context_see_xt=True,
+            )
+
+            # training path x_t
+            x_train = self.model.diffusion.q_sample(gt_x0, model_t, noise=initial_noise)
+
+            pred_velocity, _ = self.model.model(x_train.float(), model_t, **model_kwargs)
+
+            mse = ((gt_velocity - pred_velocity.float()) ** 2).flatten(1).mean(dim=1)
+
+            debug_item = {
+                "raw_t": raw_t.detach().cpu(),
+                "model_t": model_t.detach().cpu(),
+                "x": x_train.detach().cpu(),
+                "pred_velocity": pred_velocity.detach().cpu(),
+                "gt_velocity": gt_velocity.detach().cpu(),
+                "mse": mse.detach().cpu(),
+            }
+            debug_list.append(debug_item)
+
+        return debug_list
 
 
 
