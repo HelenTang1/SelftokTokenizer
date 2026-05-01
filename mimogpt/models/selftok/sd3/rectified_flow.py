@@ -161,10 +161,6 @@ class RectifiedFlow(torch.nn.Module):
         if recon_ratio != 1.0 and self.force_recon:
             terms["loss"] = recon_ratio*terms["loss"] + (1-recon_ratio)*mean_flat((v_gt - v) ** 2)
         return terms
-    def _make_fixed_probe_noise(self, shape, device, seed: int = 0):
-        g = torch.Generator(device=device)
-        g.manual_seed(seed)
-        return torch.randn(shape, generator=g, device=device)
     
     def p_sample_loop(
         self,
@@ -195,10 +191,7 @@ class RectifiedFlow(torch.nn.Module):
             device = next(model.parameters()).device
  
         if noise is None:
-            # TODO: real run
-            # img = torch.randn(*shape, device=device)
-            # TODO: DEBUG
-            img = self._make_fixed_probe_noise(shape, device=device, seed=0)
+            img = torch.randn(*shape, device=device)
         else:
             img = noise
         

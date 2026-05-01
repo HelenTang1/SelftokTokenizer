@@ -223,7 +223,12 @@ class SelftokPipeline():
         print('End encoding.')
         
         return tokens
-
+    
+    def _make_fixed_probe_noise(self, shape, device, seed: int = 0):
+        g = torch.Generator(device=device)
+        g.manual_seed(seed)
+        return torch.randn(shape, generator=g, device=device)
+    
     @torch.no_grad()
     def decoding(self, idx, device, return_debug=False, gt_images=None):
 
@@ -267,7 +272,11 @@ class SelftokPipeline():
         
         latent_dim = self.datasize // 8
 
-        xt = torch.randn(B, 16, latent_dim, latent_dim).to(device)
+        # TODO: real run
+        # xt = torch.randn(B, 16, latent_dim, latent_dim).to(device)
+        # TODO: DEBUG
+        shape = B, 16, latent_dim, latent_dim
+        xt = self._make_fixed_probe_noise(shape, device=device, seed=0)
 
         kwargs = {}
         enc_in =xt.float()
