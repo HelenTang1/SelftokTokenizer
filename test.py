@@ -66,7 +66,7 @@ img_transform = transforms.Compose([
     NormalizeToTensor(),
 ])
 
-image_paths = ['./test.jpg']
+image_paths = ['./000000.png']
 images = [img_transform(Image.open(p)) for p in image_paths]
 images = torch.stack(images).to('cuda')
 
