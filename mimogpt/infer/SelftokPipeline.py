@@ -151,7 +151,10 @@ def str_to_bool(value):
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
 class SelftokPipeline():
-    def __init__(self, cfg, ckpt_path, sd3_path, datasize = 256, start = 1.0, cfg_scale = 1,model_type='sd3', dtype=torch.bfloat16, ema_decoder=False, device=None):
+    # TODO: real run
+    # def __init__(self, cfg, ckpt_path, sd3_path, datasize = 256, start = 1.0, cfg_scale = 1,model_type='sd3', dtype=torch.bfloat16, ema_decoder=False, device=None):
+    # TODO: DEBUG
+    def __init__(self, cfg, ckpt_path, sd3_path, datasize = 256, start = 1.0, cfg_scale = 1,model_type='sd3', dtype=torch.float32, ema_decoder=False, device=None):
         
         self.cfg = cfg
         self.datasize = datasize
