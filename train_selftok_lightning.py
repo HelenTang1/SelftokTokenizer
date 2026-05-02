@@ -55,7 +55,7 @@ class RecursiveImageDataset(Dataset):
                 transforms.CenterCrop(image_size),
                 transforms.ToTensor(),
                 transforms.Lambda(lambda x: x * 2.0 - 1.0),
-            ])
+                ])
         else:
             self.transform = transforms.Compose([
                 transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
@@ -289,11 +289,11 @@ class SelftokLightningModule(pl.LightningModule):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--yml-path", type=str, default="/home/ccwang/yhtang/EventDDT_Private/submodules/SelftokTokenizer/configs/res256/256-eval.yml")
-    parser.add_argument("--train-root", type=str, default="/home/ccwang/yhtang/EventDDT_Private/submodules/SelftokTokenizer/one_img")
-    parser.add_argument("--val-root", type=str, default="/home/ccwang/yhtang/EventDDT_Private/submodules/SelftokTokenizer/one_img")
-    parser.add_argument("--sd3-pretrained", type=str, default="/20TB_04/yhtang_dataset/event_ddt_pretrained/sd3-diffusers/")
-    parser.add_argument("--output-dir", type=str, default="/20TB_04/yhtang_dataset/exp_output/outputs_tok_v2.0/tok_dsec_exp/SelfTok/")
+    parser.add_argument("--yml-path", type=str, default="/data4/yhtang/exp/EventDDT_Private/submodules/SelftokTokenizer/configs/res256/256-eval.yml")
+    parser.add_argument("--train-root", type=str, default="/data4/yhtang/exp/EventDDT_Private/submodules/SelftokTokenizer/oneimage/")
+    parser.add_argument("--val-root", type=str, default="/data4/yhtang/exp/EventDDT_Private/submodules/SelftokTokenizer/oneimage/")
+    parser.add_argument("--sd3-pretrained", type=str, default="/data4/yhtang/exp/EventDDT_Private/pretrain_weights/sd3-diffusers/")
+    parser.add_argument("--output-dir", type=str, default="/data4/yhtang/exp/EventDDT_Private/selftok/")
     parser.add_argument("--wandb-project", type=str, default="selftok")
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument("--wandb-entity", type=str, default=None)
@@ -401,12 +401,12 @@ def main() -> None:
         ModelCheckpoint(
             dirpath=str(Path(args.output_dir) / "checkpoints"),
             filename="epoch{epoch:03d}-valloss{val/loss:.4f}",
-            monitor="val/loss",
+            monitor="val/dm_mse",
             mode="min",
             save_last=True,
             save_top_k=args.save_top_k,
             auto_insert_metric_name=False,
-            every_n_epochs=50,
+            every_n_epochs=1,
         ),
         LearningRateMonitor(logging_interval="step"),
     ]
@@ -420,19 +420,26 @@ def main() -> None:
         strategy=strategy,
         sync_batchnorm=len(args.devices) > 1,
         precision=precision,
-        max_epochs=max_epochs,
+        max_epochs=50000, #TODO
         accumulate_grad_batches=args.accumulate_grad_batches,
         gradient_clip_val=args.gradient_clip_val,
         logger=logger,
         callbacks=callbacks,
         default_root_dir=args.output_dir,
-        log_every_n_steps=1,
+        log_every_n_steps=10,
         check_val_every_n_epoch=50,
         num_sanity_val_steps=2,
         deterministic=False,
     )
 
     trainer.fit(model, datamodule=datamodule, ckpt_path=args.resume)
+    if trainer.is_global_zero: # only save from the main process
+        final_ckpt_path = str(Path(args.output_dir) / "checkpoints" / "final.ckpt")
+        trainer.save_checkpoint(final_ckpt_path)
+        print(f"Saved final checkpoint to: {final_ckpt_path}")
+        import wandb
+        if wandb.run is not None:
+            wandb.finish()
 
 
 if __name__ == "__main__":
