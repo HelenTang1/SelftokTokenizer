@@ -48,6 +48,27 @@ def _to_python_scalar(x, device, batch_size = 1):
 
     return x.mean().item()
 
+
+def _cpu_tensor(x):
+    if x is None:
+        return None
+    if torch.is_tensor(x):
+        return x.detach().cpu()
+    return x
+
+def save_selftok_transfer_package(probe_list, path):
+    probe0 = probe_list[0]
+
+    package = {
+        "embed.context": _cpu_tensor(probe0["embed.context"]),
+        "input.context_condition": _cpu_tensor(probe0["input.context_condition"]),
+    }
+
+    torch.save(package, path)
+
+    print(f"[debug] saved SelfTok transfer package to: {path}")
+    print(f"[debug] cached embed.context shape: {package['embed.context'].shape}")
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--yml-path", type=str, default="./configs/res256/256-eval.yml") # download from https://huggingface.co/stabilityai/stable-diffusion-3-medium/resolve/main/sd3_medium.safetensors?download=true, require huggingface login, you have to change the format to .pt with safetensor_to_pt.py
 # parser.add_argument("--pretrained", type=str, default="/data4/yhtang/exp/EventDDT_Private/selftok/checkpoints/epoch48799-valloss0.0072.ckpt") 
@@ -81,7 +102,10 @@ images, debug_dict, probe_list = model.decoding(tokens, device='cuda',
 for b in range(len(images)):
     save_image(images[b], f"./re_{b}_{args.data_size}_2.png")
 
-
+save_selftok_transfer_package(
+    probe_list=probe_list,
+    path="selftok_embed.pt",
+)
 reverse_debug = debug_dict["reverse"]
 # training_debug = debug_dict["training"]
 raw_ts = [item["raw_t"][0].item() for item in reverse_debug]

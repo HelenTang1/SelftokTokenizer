@@ -352,16 +352,20 @@ def _probe_save(probe: Optional[dict], name: str, x, keep_full: bool = False):
 
     if torch.is_tensor(x):
         with torch.no_grad():
-            x = x.detach().float()
+            x_detached = x.detach()
 
             if keep_full:
-                probe[name] = x.cpu()
-            elif x.ndim == 0:
-                probe[name] = x.cpu()
-            elif x.ndim == 1:
-                probe[name] = x.cpu()
+                probe[name] = x_detached.cpu()
+                return
+
+            x_float = x_detached.float()
+
+            if x_float.ndim == 0:
+                probe[name] = x_float.cpu()
+            elif x_float.ndim == 1:
+                probe[name] = x_float.cpu()
             else:
-                probe[name] = x.reshape(x.shape[0], -1).mean(dim=1).cpu()
+                probe[name] = x_float.reshape(x_float.shape[0], -1).mean(dim=1).cpu()
     else:
         probe[name] = x
 
@@ -536,7 +540,7 @@ class DismantledBlock(nn.Module):
                         c_pos_embed = self.t_embedder(pos_embed)
                         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c_pos_embed).chunk(6, dim=1)
                     # TODO: DEBUG
-                    _probe_save(probe, f"{prefix}.c_pos_embed", c_pos_embed.mean())
+                    _probe_save(probe, f"{prefix}.c_pos_embed", c_pos_embed)
                     _probe_save(probe, f"{prefix}.shift_msa", shift_msa.mean())
                     _probe_save(probe, f"{prefix}.scale_msa_abs", scale_msa.abs().mean())
                     _probe_save(probe, f"{prefix}.gate_msa_abs", gate_msa.abs().mean())
@@ -1162,7 +1166,7 @@ class MMDiT(nn.Module):
         probe = kwargs.pop("probe", None)
         _probe_save(probe, "input.x_raw", x)
         _probe_save(probe, "input.t_raw", t)
-        _probe_save(probe, "input.context_condition", encoder_hidden_states)
+        _probe_save(probe, "input.context_condition", encoder_hidden_states, keep_full=True)
         
         hw = x.shape[-2:]
         t = t * 1000.0
@@ -1202,7 +1206,7 @@ class MMDiT(nn.Module):
         # self.context_pos_embed  # (1, K, D)  for context t-agnostic, token_pos-based
         context = self.context_embedder(encoder_hidden_states).to(x.dtype) + self.context_pos_embed
         # TODO: DEBUG
-        _probe_save(probe, "embed.context", context)
+        _probe_save(probe, "embed.context", context, keep_full=True)
 
         if hidden_states_low_res is not None and self.low_res_context:
             context_lowres = \
