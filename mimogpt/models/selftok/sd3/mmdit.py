@@ -983,6 +983,18 @@ class MMDiT(nn.Module):
         )
         
         self.context_pos_embed.data.copy_(torch.from_numpy(context_pos_embed).float().unsqueeze(0))
+        # TODO: DEBUG
+        self.init_context_pos_embed = torch.from_numpy(context_pos_embed).float().unsqueeze(0)
+        pos_embed = get_2d_sincos_pos_embed(
+                embed_dim=hidden_size,
+                grid_size=self.pos_embed_max_size,
+                scaling_factor=4,
+                offset=16
+                # scaling_factor=self.pos_embed_scaling_factor,
+                # offset=self.pos_embed_offset
+                )
+        self.init_pos_embed = torch.from_numpy(pos_embed).float().unsqueeze(0)
+
 
 
     def freeze(self):
@@ -1173,6 +1185,11 @@ class MMDiT(nn.Module):
         x = self.x_embedder(x) + self.cropped_pos_embed(hw)
         # TODO: DEBUG
         _probe_save(probe, "embed.x_tokens", x)
+        allclose3e_3 = torch.allclose(self.context_pos_embed.float(), 
+                self.init_context_pos_embed.to(torch.bfloat16).float().cuda(), atol=3e-3, rtol=3e-3)
+        assert allclose3e_3
+        assert (self.context_pos_embed == self.init_context_pos_embed.cuda()).all()
+
 
         low_res_latent = kwargs.get("low_res_latent", None)
         x_mask = kwargs.get("x_mask", None)
